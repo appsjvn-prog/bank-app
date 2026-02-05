@@ -1,31 +1,42 @@
 from pydantic import BaseModel, EmailStr, Field, field_validator
-
-
+from typing import Optional
 
 class AccountBase(BaseModel):
-    first_name: str = Field(..., min_length=1, max_length=50)
-    last_name: str = Field(..., min_length=1, max_length=50)
+    first_name: str
+    last_name: str
     email: EmailStr
-    phone_number: str = Field(..., min_length=10, max_length=10)
-    permanent_address: str = Field(..., min_length=5, max_length=200)
-    username: str | None = None 
+    phone_number: str
+    permanent_address: str
+    username: str | None = None
 
     class Config:
         from_attributes = True
 
     @field_validator("phone_number")
-    def phone_must_be_digits(cls, v):
+    def phone_digits_only(cls, v):
         if not v.isdigit():
             raise ValueError("Phone number must contain only digits")
+        
+        if len(v) != 10:
+            raise ValueError("Phone number must be exactly 10 digits")
+        
         return v
 
 class AccountCreate(AccountBase):
-    password: str = Field(..., min_length=6)  # user provides password
+    password: str = Field(..., min_length=6,max_length=72)
+
+class AccountUpdate(BaseModel):
+    first_name: str | None = None
+    last_name: str | None = None
+    phone_number: str | None = None
+    permanent_address: str | None = None
+    username: str | None = None
+    password: str | None = Field(None, min_length=6, max_length=72)
+
 
 class AccountResponse(AccountBase):
     id: int
     is_active: bool
+    role: str
 
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
+

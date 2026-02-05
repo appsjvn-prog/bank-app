@@ -1,18 +1,17 @@
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from passlib.context import CryptContext
+from sqlalchemy.exc import IntegrityError
 from database import engine, SessionLocal
 import models, schemas
-from schemas import LoginRequest
-from security import verify_password
-from auth import create_access_token
+from security import verify_password, hash_password
+from auth import create_access_token, get_current_user, admin_required
 
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Banking API")
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
+# ---------------- DATABASE SESSION ----------------
 def get_db():
     db = SessionLocal()
     try:
@@ -20,41 +19,18 @@ def get_db():
     finally:
         db.close()
 
-
+# ---------------- ROOT ----------------
 @app.get("/")
 def root():
     return {"message": "Banking backend is running"}
 
-
+# ---------------- USER CREATE ----------------
 @app.post("/users", response_model=schemas.AccountResponse)
-def create_users(account: schemas.AccountCreate, db: Session = Depends(get_db)):
-   
-    if db.query(models.Account).filter(models.Account.email == account.email).first():
-        raise HTTPException(
-            status_code=400, detail="Account already exists with this email"
-            )
-    
-    if db.query(models.Account).filter(models.Account.phone_number == account.phone_number).first():
-        raise HTTPException(
-            status_code=400,
-            detail="Account already exists with this phone number"
-        )
-    
-    if account.username:
-        if db.query(models.Account).filter(
-            models.Account.username == account.username
-        ).first():
-            raise HTTPException(
-                status_code=400,
-                detail="Username already taken"
-            )
+def create_user(account: schemas.AccountCreate, db: Session = Depends(get_db)):
 
+    hashed_password = hash_password(account.password)
 
-    
-    hashed_password = pwd_context.hash(account.password)
-
-    
-    new_account = models.Account(
+    new_user = models.Account(
         first_name=account.first_name,
         last_name=account.last_name,
         email=account.email,
@@ -64,53 +40,104 @@ def create_users(account: schemas.AccountCreate, db: Session = Depends(get_db)):
         password_hash=hashed_password
     )
 
-    db.add(new_account)
-    db.commit()
-    db.refresh(new_account)
-    return new_account
+    db.add(new_user)
 
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        if "email" in str(e.orig):
+            raise HTTPException(status_code=400, detail="Email already exists")
+        if "phone_number" in str(e.orig):
+            raise HTTPException(status_code=400, detail="Phone number already exists")
+        raise HTTPException(status_code=400, detail="User already exists")
 
-@app.get("/users", response_model=list[schemas.AccountResponse])
-def get_users(db: Session = Depends(get_db)):
-    return db.query(models.Account).filter(models.Account.is_active == True).all()
+    db.refresh(new_user)
+    return new_user
 
-
-@app.delete("/users/{account_id}", response_model=schemas.AccountResponse)
-def soft_delete_account(account_id: int, db: Session = Depends(get_db)):
-    account = db.query(models.Account).filter(
-        models.Account.id == account_id,
-        models.Account.is_active == True
-    ).first()
-
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-
-    account.is_active = False
-    db.commit()
-    db.refresh(account)
-    return account
-
+# ---------------- LOGIN ----------------
 @app.post("/login")
-def login(data: LoginRequest, db: Session = Depends(get_db)):
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
     user = db.query(models.Account).filter(
-        models.Account.email == data.email,
+        models.Account.email == form_data.username,
         models.Account.is_active == True
     ).first()
 
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_access_token({"sub": str(user.id)})
+
+    return {"access_token": token, "token_type": "bearer"}
+
+# ---------------- USER SELF ----------------
+@app.get("/users/me", response_model=schemas.AccountResponse)
+def get_me(current_user: models.Account = Depends(get_current_user)):
+    return current_user
+
+@app.put("/users/me", response_model=schemas.AccountResponse)
+def update_me(
+    data: schemas.AccountUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.Account = Depends(get_current_user)
+):
+    # Reload current_user from the same session
+    user = db.query(models.Account).filter(models.Account.id == current_user.id).first()
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=404, detail="User not found")
 
-    if not verify_password(data.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    for field, value in data.dict(exclude_unset=True).items():
+        if field == "password":
+            user.password_hash = hash_password(value)
+        else:
+            setattr(user, field, value)
 
-    access_token = create_access_token(
-        data={"sub": str(user.id)}
-    )
+    db.commit()
+    db.refresh(user)
+    return user
 
-    return {
-        "message": "Login successful",
-        "user_id": user.id,
-        "email": user.email,
-        "access_token": access_token,
-        "token_type": "bearer"
-    }
+# ---------------- ADMIN ----------------
+@app.get("/admin/users", response_model=list[schemas.AccountResponse])
+def admin_get_users(
+    db: Session = Depends(get_db),
+    admin: models.Account = Depends(admin_required)
+):
+    return db.query(models.Account).all()
+
+@app.put("/admin/users/{user_id}", response_model=schemas.AccountResponse)
+def admin_update_user(
+    user_id: int,
+    data: schemas.AccountUpdate,
+    db: Session = Depends(get_db),
+    admin: models.Account = Depends(admin_required)
+):
+    user = db.query(models.Account).filter(models.Account.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    for field, value in data.dict(exclude_unset=True).items():
+        if field == "password":
+            user.password_hash = hash_password(value)
+        else:
+            setattr(user, field, value)
+
+    db.commit()
+    db.refresh(user)
+    return user
+
+@app.delete("/admin/users/{user_id}")
+def admin_delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: models.Account = Depends(admin_required)
+):
+    user = db.query(models.Account).filter(models.Account.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.is_active = False
+    db.commit()
+    return {"message": "User deactivated"}
