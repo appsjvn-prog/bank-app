@@ -17,7 +17,11 @@ def mask_aadhaar(aadhaar: str) -> str:
     return "XXXX-XXXX-" + aadhaar[-4:]
 
 def mask_pan(pan: str) -> str:
-    return pan[:5] + "****"
+    if len(pan) != 10:
+        raise ValueError("Invalid PAN length")
+
+    return "*****" + pan[5:9] + "*"
+
 
 
 def hash_value(value: str) -> str:

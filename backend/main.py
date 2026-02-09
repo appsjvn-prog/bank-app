@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 import os
 
+
 from database import engine, SessionLocal
 import models, schemas
 from security import (
@@ -189,34 +190,45 @@ def admin_soft_delete_user(
 
 # KYC SUBMISSION
 
+from fastapi import Form
+
 @app.post("/kyc/submit")
 def submit_kyc(
     aadhaar_number: str = Form(..., min_length=12, max_length=12),
     pan_number: str = Form(..., min_length=10, max_length=10),
+    last_name: str = Form(...),
     document: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: models.Account = Depends(get_current_user),
 ):
-    # IMPORTANT: reattach user to SAME session
-    user = db.query(models.Account).filter(models.Account.id == current_user.id).first()
+    # Create KYC object for validation
+    try:
+        kyc = schemas.KYCSubmit(
+            aadhaar_number=aadhaar_number,
+            pan_number=pan_number,
+            last_name=last_name
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
+    # Reattach user to same session
+    user = db.query(models.Account).filter(models.Account.id == current_user.id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # KYC already approved
     if user.kyc_status == "approved":
         raise HTTPException(status_code=400, detail="KYC already approved")
 
-    # Hash + Mask (NO RAW STORAGE)
-    user.aadhaar_hash = hash_value(aadhaar_number)
-    user.aadhaar_masked = mask_aadhaar(aadhaar_number)
+    # Hash + mask sensitive info
+    user.aadhaar_hash = hash_value(kyc.aadhaar_number)
+    user.aadhaar_masked = mask_aadhaar(kyc.aadhaar_number)
+    user.pan_hash = hash_value(kyc.pan_number)
+    user.pan_masked = mask_pan(kyc.pan_number)
 
-    user.pan_hash = hash_value(pan_number)
-    user.pan_masked = mask_pan(pan_number)
-
-    # Save document
+    # Save uploaded KYC document
     os.makedirs("uploads/kyc", exist_ok=True)
     file_path = f"uploads/kyc/{user.id}_{document.filename}"
-
     with open(file_path, "wb") as f:
         f.write(document.file.read())
 
@@ -227,7 +239,7 @@ def submit_kyc(
 
     return {
         "message": "KYC submitted successfully",
-        "kyc_status": user.kyc_status,
+        "kyc_status": user.kyc_status
     }
 
 # -------------------------------------------------
